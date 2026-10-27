@@ -41,9 +41,10 @@ static NSString *kEventCellIdentifier = @"EventCell";
 @property (nonatomic) BOOL dim;
 @end
 
-@interface AgendaPopoverVC : NSViewController
+@interface AgendaPopoverVC : NSViewController <NSTableViewDataSource, NSTableViewDelegate>
 @property (nonatomic, weak) NSCalendar *nsCal;
 @property (nonatomic) NSButton *btnDelete;
+@property (nonatomic, weak) NSPopover *popover;
 - (void)populateWithEventInfo:(EventInfo *)info;
 - (void)scrollToTopAndFlashScrollers;
 - (NSSize)size;
@@ -276,7 +277,9 @@ static NSString *kEventCellIdentifier = @"EventCell";
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         self->_popover = [MoPopover new];
-        self->_popover.contentViewController = [AgendaPopoverVC new];
+        AgendaPopoverVC *popoverVC = [AgendaPopoverVC new];
+        popoverVC.popover = self->_popover;
+        self->_popover.contentViewController = popoverVC;
         self->_popover.behavior = NSPopoverBehaviorTransient;
         self->_popover.animates = NO;
         // Enable coloring the full background including the arrow.
@@ -958,6 +961,49 @@ static NSString *kEventCellIdentifier = @"EventCell";
 
 #define POPOVER_TEXT_WIDTH 280
 
+static const NSUInteger kAttendeePreviewLimit = 100;
+static const CGFloat kPopoverMaximumHeight = 720;
+static const CGFloat kPopoverScreenMargin = 80;
+static const CGFloat kPopoverVerticalPadding = 16;
+static NSString * const kAttendeeCellIdentifier = @"Attendee";
+
+@interface AgendaAttendeeView : NSStackView
+@property (nonatomic) NSTextField *statusLabel;
+@property (nonatomic) NSTextField *participantLabel;
+@property (nonatomic) NSTextField *organizerLabel;
+@end
+
+@implementation AgendaAttendeeView
+@end
+
+@interface AgendaAttendeeCell : NSTableCellView
+@property (nonatomic) AgendaAttendeeView *attendeeView;
+@end
+
+@implementation AgendaAttendeeCell
+@end
+
+@interface AgendaAttendeeScrollView : NSScrollView
+@end
+
+@implementation AgendaAttendeeScrollView
+- (void)tile
+{
+    [super tile];
+    // Legacy scrollbars take space away from the table column.
+    NSTableView *table = (NSTableView *)self.documentView;
+    CGFloat width = self.contentSize.width;
+    if (table && width > 0 && fabs(table.tableColumns.firstObject.width - width) > 0.5) {
+        [table sizeLastColumnToFit];
+    }
+}
+@end
+
+static BOOL ParticipantIsOrganizer(EKParticipant *participant, EKParticipant *organizer)
+{
+    return participant == organizer || [participant.URL.resourceSpecifier isEqualToString:organizer.URL.resourceSpecifier];
+}
+
 @implementation AgendaPopoverVC
 {
     NSGridView  *_grid;
@@ -968,6 +1014,13 @@ static NSString *kEventCellIdentifier = @"EventCell";
     NSTextView *_note;
     NSTextView *_URL;
     NSStackView *_attendees;
+    NSButton *_moreAttendees;
+    NSTableView *_attendeeTable;
+    NSScrollView *_attendeeScrollView;
+    NSLayoutConstraint *_attendeeListHeight;
+    BOOL _attendeesExpanded;
+    NSArray<EKParticipant *> *_participants;
+    EKParticipant *_organizer;
     NSScrollView *_scrollView;
     NSDataDetector *_linkDetector;
     NSRegularExpression *_hiddenLinksRegex;
@@ -1033,6 +1086,34 @@ static NSString *kEventCellIdentifier = @"EventCell";
         _attendees.detachesHiddenViews = NO;
         [_attendees setClippingResistancePriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationVertical];
         
+        _moreAttendees = [NSButton buttonWithTitle:@"" target:self action:@selector(toggleAllAttendees:)];
+        _moreAttendees.bordered = NO;
+        _moreAttendees.contentTintColor = NSColor.linkColor;
+
+        _attendeeTable = [NSTableView new];
+        _attendeeTable.headerView = nil;
+        _attendeeTable.style = NSTableViewStylePlain;
+        _attendeeTable.backgroundColor = NSColor.clearColor;
+        _attendeeTable.selectionHighlightStyle = NSTableViewSelectionHighlightStyleNone;
+        _attendeeTable.intercellSpacing = NSMakeSize(0, 4);
+        _attendeeTable.columnAutoresizingStyle = NSTableViewLastColumnOnlyAutoresizingStyle;
+        _attendeeTable.autoresizingMask = NSViewWidthSizable;
+        _attendeeTable.dataSource = self;
+        _attendeeTable.delegate = self;
+        NSTableColumn *attendeeColumn = [[NSTableColumn alloc] initWithIdentifier:kAttendeeCellIdentifier];
+        attendeeColumn.width = POPOVER_TEXT_WIDTH;
+        attendeeColumn.resizingMask = NSTableColumnAutoresizingMask;
+        [_attendeeTable addTableColumn:attendeeColumn];
+
+        _attendeeScrollView = [AgendaAttendeeScrollView new];
+        _attendeeScrollView.drawsBackground = NO;
+        _attendeeScrollView.hasVerticalScroller = YES;
+        _attendeeScrollView.verticalScroller = [ThemedScroller new];
+        _attendeeScrollView.documentView = _attendeeTable;
+        [_attendeeScrollView.widthAnchor constraintEqualToConstant:POPOVER_TEXT_WIDTH].active = YES;
+        _attendeeListHeight = [_attendeeScrollView.heightAnchor constraintEqualToConstant:0];
+        _attendeeListHeight.active = YES;
+
         _grid = [NSGridView gridViewWithViews:@[@[titleHolder],  // row 0
                                                 @[_location],    // 1
                                                 @[separator()],  // 2
@@ -1096,12 +1177,12 @@ static NSString *kEventCellIdentifier = @"EventCell";
 
 - (NSSize)size
 {
-    // See -loadView. Vertial padding top+bottom = 16.
+    // See -loadView for vertical padding.
     // Also take into account the safe area.
     CGFloat h = self.view.safeAreaInsets.left + self.view.safeAreaInsets.right;
     CGFloat v = self.view.safeAreaInsets.top + self.view.safeAreaInsets.bottom;
     return NSMakeSize(_grid.fittingSize.width + h,
-                      _grid.fittingSize.height + v + 16);
+                      MIN(_grid.fittingSize.height + v + kPopoverVerticalPadding, [self maximumPopoverHeight]));
 }
 
 - (void)scrollToTopAndFlashScrollers
@@ -1224,12 +1305,6 @@ static NSString *kEventCellIdentifier = @"EventCell";
     // Attendees
     if (info.event.hasAttendees) {
         
-        // Block returns YES if participant is the event's organizer.
-        BOOL (^ParticipantIsOrganizer)(EKParticipant*, EKParticipant*) = ^BOOL(EKParticipant *participant, EKParticipant *organizer) {
-            // https://stackoverflow.com/a/17222036/111418
-            return [participant.URL.resourceSpecifier isEqualToString:organizer.URL.resourceSpecifier];
-        };
-        
         // Sometimes info.event.organizer isn't in info.event.attendees.
         // Make an array of participants that definitely has the organizer.
         NSMutableArray<EKParticipant *> *participants = [NSMutableArray new];
@@ -1243,69 +1318,28 @@ static NSString *kEventCellIdentifier = @"EventCell";
             }
         }
         // Sort participants with organizer first, then accepted, pending, declined.
-        NSArray<EKParticipant *> *sortedParticipants = [participants sortedArrayUsingComparator:^NSComparisonResult(EKParticipant * p1, EKParticipant *p2) {
-            if (ParticipantIsOrganizer(p1, info.event.organizer)) return NSOrderedAscending;
-            if (ParticipantIsOrganizer(p2, info.event.organizer)) return NSOrderedDescending;
-            if (p1.participantStatus == EKParticipantStatusAccepted) return NSOrderedAscending;
-            if (p2.participantStatus == EKParticipantStatusAccepted) return NSOrderedDescending;
-            if (p1.participantStatus == EKParticipantStatusPending) return NSOrderedAscending;
-            if (p2.participantStatus == EKParticipantStatusPending) return NSOrderedDescending;
-            return NSOrderedDescending;
+        NSInteger (^ParticipantOrder)(EKParticipant *) = ^NSInteger(EKParticipant *p) {
+            if (ParticipantIsOrganizer(p, info.event.organizer)) return 0;
+            if (p.participantStatus == EKParticipantStatusAccepted) return 1;
+            if (p.participantStatus == EKParticipantStatusPending) return 2;
+            return 3;
+        };
+        NSArray<EKParticipant *> *sortedParticipants = [participants sortedArrayWithOptions:NSSortStable usingComparator:^NSComparisonResult(EKParticipant * p1, EKParticipant *p2) {
+            NSInteger order1 = ParticipantOrder(p1), order2 = ParticipantOrder(p2);
+            if (order1 < order2) return NSOrderedAscending;
+            if (order1 > order2) return NSOrderedDescending;
+            return NSOrderedSame;
         }];
-        NSMutableArray<NSStackView *> *attendeesArray = [NSMutableArray new];
-        for (EKParticipant *participant in sortedParticipants) {
-            NSString *orgIcon = ParticipantIsOrganizer(participant, info.event.organizer) ? @"•" : @"";
-            NSString *statusIcon = @"􀁜"; // questionmark.circle (Requires SF fonts to see)
-            NSColor *textColor = Theme.agendaEventDateTextColor;
-            if (participant.participantStatus == EKParticipantStatusAccepted) {
-                statusIcon = @"􀁢"; // checkmark.circle (Requires SF fonts to see)
-                textColor = NSColor.systemGreenColor;
-            }
-            if (participant.participantStatus == EKParticipantStatusDeclined) {
-                statusIcon = @"􀁐"; // x.circle (Requires SF fonts to see)
-                textColor = NSColor.systemRedColor;
-            }
-
-            // Status icons are in the embedded font Mow.otf, CANNOT compress.
-            NSTextField *statusLabel = [NSTextField labelWithString:statusIcon];
-            statusLabel.textColor = textColor;
-            statusLabel.font = [NSFont fontWithName:@"Mow" size:SizePref.fontSize];
-            [statusLabel setContentCompressionResistancePriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
-
-            // EKParticipant name and URL.resourceSpecifier (email addr)
-            // are nullable (why?...). Make sure we don't try to create
-            // a label with a null string.
-            NSString *participantString = participant.name;
-            if (!participantString) {
-                participantString = participant.URL.resourceSpecifier; // email addr
-                if (!participantString) participantString = @"***";
-            }
-
-            // Participant uses system font, CAN compress.
-            NSTextField *participantLabel = [NSTextField labelWithString:participantString];
-            participantLabel.selectable = YES;
-            participantLabel.lineBreakMode = NSLineBreakByTruncatingTail;
-            participantLabel.textColor = Theme.agendaEventTextColor;
-            participantLabel.font = [NSFont systemFontOfSize:SizePref.fontSize];
-            [participantLabel setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
-
-            // Organizer icon uses system font, CANNOT compress.
-            NSTextField *organizerLabel = [NSTextField labelWithString:orgIcon];
-            organizerLabel.textColor = Theme.agendaEventTextColor;
-            organizerLabel.font = [NSFont systemFontOfSize:SizePref.fontSize];
-            [organizerLabel setContentCompressionResistancePriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
-
-            // Horizontally stack status icon, participant, organizer indicator.
-            NSStackView *attendee = [NSStackView stackViewWithViews:@[statusLabel, participantLabel, organizerLabel]];
-            attendee.alignment = NSLayoutAttributeBaseline;
-            attendee.detachesHiddenViews = NO;
-            [attendee setHuggingPriority:NSLayoutPriorityDefaultHigh forOrientation:NSLayoutConstraintOrientationHorizontal];
-            [attendee setClippingResistancePriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
-            [attendeesArray addObject:attendee];
-        }
-        // Vertically stack attendees.
-        [_attendees setViews:attendeesArray inGravity:NSStackViewGravityBottom];
+        _participants = sortedParticipants;
+        _organizer = info.event.organizer;
     }
+    else {
+        _participants = @[];
+        _organizer = nil;
+    }
+    _attendeesExpanded = NO;
+    [_attendees setViews:@[] inGravity:NSStackViewGravityBottom];
+    [_attendeeTable reloadData];
 
     // Notes
     if (info.event.hasNotes) {
@@ -1342,6 +1376,166 @@ static NSString *kEventCellIdentifier = @"EventCell";
     _title.textColor = Theme.agendaEventTextColor;
     _duration.textColor = Theme.agendaEventTextColor;
     _recurrence.textColor = Theme.agendaEventTextColor;
+    [self updateAttendeeDisplay];
+}
+
+- (CGFloat)maximumPopoverHeight
+{
+    NSScreen *screen = self.view.window.screen ?: NSScreen.mainScreen;
+    if (!screen) return kPopoverMaximumHeight;
+    return MAX(1, MIN(kPopoverMaximumHeight, NSHeight(screen.visibleFrame) - kPopoverScreenMargin));
+}
+
+- (void)viewDidAppear
+{
+    [super viewDidAppear];
+    // The popover may have moved to a different screen since it was populated.
+    [self updateAttendeeDisplay];
+    [self.view layoutSubtreeIfNeeded];
+    self.popover.contentSize = self.size;
+}
+
+- (void)updateAttendeeDisplay
+{
+    if (_participants.count == 0) {
+        [_attendees setViews:@[] inGravity:NSStackViewGravityBottom];
+        return;
+    }
+    AgendaAttendeeView *sample = [self attendeeViewForParticipant:_participants.firstObject reusingView:nil];
+    CGFloat rowHeight = sample.fittingSize.height;
+    CGFloat stride = rowHeight + _attendees.spacing;
+    CGFloat otherHeight = _grid.fittingSize.height - _attendees.fittingSize.height;
+    otherHeight += self.view.safeAreaInsets.top + self.view.safeAreaInsets.bottom + kPopoverVerticalPadding;
+    CGFloat available = MAX(rowHeight, [self maximumPopoverHeight] - otherHeight);
+    NSUInteger previewCount = MIN(kAttendeePreviewLimit, MAX(1, floor((available + _attendees.spacing) / stride)));
+    BOOL needsDisclosure = _participants.count > previewCount;
+    _moreAttendees.font = [NSFont systemFontOfSize:SizePref.fontSize];
+    _moreAttendees.title = _attendeesExpanded
+        ? NSLocalizedString(@"Show Fewer Participants", @"Collapse full participant list")
+        : [NSString stringWithFormat:NSLocalizedString(@"Show All Participants (%lu)", @"Expand full participant list"), (unsigned long)_participants.count];
+    if (needsDisclosure || _attendeesExpanded) {
+        available = MAX(rowHeight, available - _moreAttendees.fittingSize.height - _attendees.spacing);
+        previewCount = MIN(kAttendeePreviewLimit, MAX(1, floor((available + _attendees.spacing) / stride)));
+    }
+    NSMutableArray<NSView *> *views = [NSMutableArray new];
+    if (_attendeesExpanded) {
+        // Keep the viewport bounded. NSTableView creates and reuses only visible rows.
+        _attendeeTable.rowHeight = rowHeight;
+        _attendeeListHeight.constant = MIN(available, _participants.count * stride - _attendees.spacing);
+        [views addObject:_attendeeScrollView];
+    }
+    else {
+        NSUInteger count = MIN(previewCount, _participants.count);
+        for (NSUInteger i = 0; i < count; i++) {
+            [views addObject:i == 0 ? sample : [self attendeeViewForParticipant:_participants[i] reusingView:nil]];
+        }
+    }
+    if (needsDisclosure || _attendeesExpanded) [views addObject:_moreAttendees];
+    [_attendees setViews:views inGravity:NSStackViewGravityBottom];
+}
+
+- (AgendaAttendeeView *)attendeeViewForParticipant:(EKParticipant *)participant reusingView:(AgendaAttendeeView *)attendee
+{
+    if (!attendee) {
+        NSTextField *statusLabel = [NSTextField labelWithString:@""];
+        [statusLabel setContentCompressionResistancePriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
+
+        NSTextField *participantLabel = [NSTextField labelWithString:@""];
+        participantLabel.selectable = YES;
+        participantLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+        [participantLabel setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+
+        NSTextField *organizerLabel = [NSTextField labelWithString:@""];
+        [organizerLabel setContentCompressionResistancePriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
+
+        attendee = [AgendaAttendeeView stackViewWithViews:@[statusLabel, participantLabel, organizerLabel]];
+        attendee.statusLabel = statusLabel;
+        attendee.participantLabel = participantLabel;
+        attendee.organizerLabel = organizerLabel;
+        attendee.alignment = NSLayoutAttributeBaseline;
+        attendee.detachesHiddenViews = NO;
+        [attendee setHuggingPriority:NSLayoutPriorityDefaultHigh forOrientation:NSLayoutConstraintOrientationHorizontal];
+        [attendee setClippingResistancePriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
+    }
+    NSString *orgIcon = ParticipantIsOrganizer(participant, _organizer) ? @"•" : @"";
+    NSString *statusIcon = @"􀁜"; // questionmark.circle (Requires SF fonts to see)
+    NSColor *textColor = Theme.agendaEventDateTextColor;
+    if (participant.participantStatus == EKParticipantStatusAccepted) {
+        statusIcon = @"􀁢"; // checkmark.circle (Requires SF fonts to see)
+        textColor = NSColor.systemGreenColor;
+    }
+    if (participant.participantStatus == EKParticipantStatusDeclined) {
+        statusIcon = @"􀁐"; // x.circle (Requires SF fonts to see)
+        textColor = NSColor.systemRedColor;
+    }
+
+    // Status icons use the embedded font; names use the system font.
+    attendee.statusLabel.stringValue = statusIcon;
+    attendee.statusLabel.textColor = textColor;
+    attendee.statusLabel.font = [NSFont fontWithName:@"Mow" size:SizePref.fontSize];
+
+    // Both the name and email address can be missing.
+    NSString *participantString = participant.name;
+    if (!participantString) {
+        participantString = participant.URL.resourceSpecifier; // email addr
+        if (!participantString) participantString = NSLocalizedString(@"Unknown Participant", @"Participant with no name or email address");
+    }
+
+    attendee.participantLabel.stringValue = participantString;
+    attendee.participantLabel.textColor = Theme.agendaEventTextColor;
+    attendee.participantLabel.font = [NSFont systemFontOfSize:SizePref.fontSize];
+
+    attendee.organizerLabel.stringValue = orgIcon;
+    attendee.organizerLabel.textColor = Theme.agendaEventTextColor;
+    attendee.organizerLabel.font = [NSFont systemFontOfSize:SizePref.fontSize];
+    return attendee;
+}
+
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView
+{
+    return _participants.count;
+}
+
+- (NSView *)tableView:(NSTableView *)tableView viewForTableColumn:(NSTableColumn *)tableColumn row:(NSInteger)row
+{
+    AgendaAttendeeCell *cell = [tableView makeViewWithIdentifier:kAttendeeCellIdentifier owner:self];
+    if (!cell) {
+        cell = [AgendaAttendeeCell new];
+        cell.identifier = kAttendeeCellIdentifier;
+        AgendaAttendeeView *view = [self attendeeViewForParticipant:_participants[row] reusingView:nil];
+        view.translatesAutoresizingMaskIntoConstraints = NO;
+        [cell addSubview:view];
+        [NSLayoutConstraint activateConstraints:@[
+            [view.leadingAnchor constraintEqualToAnchor:cell.leadingAnchor],
+            [view.trailingAnchor constraintLessThanOrEqualToAnchor:cell.trailingAnchor],
+            [view.centerYAnchor constraintEqualToAnchor:cell.centerYAnchor],
+        ]];
+        cell.attendeeView = view;
+        cell.textField = view.participantLabel;
+    }
+    else {
+        [self attendeeViewForParticipant:_participants[row] reusingView:cell.attendeeView];
+    }
+    return cell;
+}
+
+- (BOOL)tableView:(NSTableView *)tableView shouldSelectRow:(NSInteger)row
+{
+    return NO;
+}
+
+- (void)toggleAllAttendees:(id)sender
+{
+    _attendeesExpanded = !_attendeesExpanded;
+    [self updateAttendeeDisplay];
+    [self.view layoutSubtreeIfNeeded];
+    self.popover.contentSize = self.size;
+    if (_attendeesExpanded) {
+        [_attendeeTable scrollRowToVisible:0];
+        [_attendeeScrollView flashScrollers];
+    }
+    [self scrollToTopAndFlashScrollers];
+    [self.view.window makeFirstResponder:_btnDelete];
 }
 
 - (void)populateTextView:(NSTextView *)textView withString:(NSString *)string heightConstraint:(NSLayoutConstraint *)constraint
